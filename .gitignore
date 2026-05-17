@@ -1,0 +1,5 @@
+/target
+.env
+*.wav
+/tmp
+Cargo.lock
