@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use std::process::Command;
 use tracing::{info, warn};
 
+#[derive(Clone)]
 pub struct TtsEngine {
     venv_python: String,
 }
@@ -77,5 +78,15 @@ if result.returncode != 0:
         }
 
         Ok(())
+    }
+
+    pub fn stop_speaking() {
+        info!("🛑 Остановка озвучки");
+        let _ = std::process::Command::new("pkill")
+            .args(&["-9", "ffplay"])
+            .status();
+        let _ = std::process::Command::new("pkill")
+            .args(&["-9", "aplay"])
+            .status();
     }
 }

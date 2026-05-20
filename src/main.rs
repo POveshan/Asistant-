@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 mod audio;
@@ -15,7 +15,6 @@ use system::KdeIntegration;
 
 #[derive(Debug, Clone, Default)]
 pub struct KuroState {
-    pub listening: bool,
     pub last_command: Option<String>,
 }
 
@@ -25,14 +24,19 @@ async fn main() -> Result<()> {
         .with_env_filter("info,kuro_assistant=debug")
         .init();
 
-    info!("🎌 Kuro Assistant запускается...");
+    info!("🎌 Шилов Ассистент запускается...");
+    info!("🎤 Скажи 'Шилов' чтобы разбудить");
 
-    let state = Arc::new(RwLock::new(KuroState::default()));
+    let state = Arc::new(Mutex::new(KuroState::default()));
     let kde = KdeIntegration::new().await?;
     let router = CommandRouter::new(kde);
     let stt = SttEngine::new()?;
     let capture = AudioCapture::new(stt)?;
-    let tts = TtsEngine::new(); // ← ДОБАВИЛИ TTS
+    let tts = TtsEngine::new();
+
+    let is_speaking = Arc::new(Mutex::new(false));
+    let is_awake = Arc::new(Mutex::new(false));
+    let dialog_history = Arc::new(Mutex::new(Vec::new()));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
 
@@ -42,30 +46,149 @@ async fn main() -> Result<()> {
         }
     };
 
+    let is_speaking_clone = Arc::clone(&is_speaking);
+    let is_awake_clone = Arc::clone(&is_awake);
+    let dialog_history_clone = Arc::clone(&dialog_history);
+
     let router_handle = tokio::spawn(async move {
         while let Some(text) = rx.recv().await {
-            let text = text.to_lowercase().trim().to_string();
-            info!("📝 Распознано: '{}'", text);
+            let lower = text.to_lowercase();
 
-            {
-                let mut state = state.write().await;
-                state.last_command = Some(text.clone());
+            // Если ассистент говорит — новый запрос прерывает речь
+            if *is_speaking_clone.lock().await {
+                let stop_words = ["хватит", "прекрати", "заткнись", "стоп", "тихо", "замолчи"];
+                if stop_words.iter().any(|&w| lower.contains(w)) {
+                    info!("🛑 Стоп-слово! Прерываю...");
+                    TtsEngine::stop_speaking();
+                    *is_speaking_clone.lock().await = false;
+                    continue;
+                }
+
+                info!("🛑 Новый запрос! Прерываю текущую речь...");
+                TtsEngine::stop_speaking();
+                *is_speaking_clone.lock().await = false;
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
             }
 
-            match router.execute(&text).await {
-                Ok(result) => {
-                    info!("✅ Выполнено: {}", result);
-                    tts.speak(&result).await.ok(); // ← ГОВОРИМ результат команды
+            let text = lower.trim().to_string();
+            info!("📝 Распознано: '{}'", text);
+
+            let mut clean_text = String::new();
+            let mut should_process = false;
+
+            // Wake word логика
+            {
+                let mut awake = is_awake_clone.lock().await;
+                if !*awake {
+                    if text.contains("шилов") || text.contains("шил") {
+                        *awake = true;
+
+                        clean_text = text
+                            .replace("шилов", "")
+                            .replace("шил", "")
+                            .trim()
+                            .to_string();
+
+                        if clean_text.is_empty() {
+                            // Только "Шилов" — отвечаем
+                            info!("🌅 Шилов проснулся!");
+                            let tts_clone = tts.clone();
+                            tokio::spawn(async move {
+                                tts_clone.speak("Да, я здесь").await.ok();
+                            });
+                            continue;
+                        }
+
+                        // "Шилов открой браузер" — просыпаемся И сразу выполняем
+                        info!("🌅 Шилов проснулся и сразу выполняет: '{}'", clean_text);
+                        should_process = true;
+                    } else {
+                        info!("🤐 Шилов спит, скажи 'Шилов' чтобы разбудить");
+                        continue;
+                    }
+                } else {
+                    // Уже бодрствует — убираем wake word если есть
+                    clean_text = text
+                        .replace("шилов", "")
+                        .replace("шил", "")
+                        .trim()
+                        .to_string();
+
+                    if clean_text.is_empty() {
+                        continue;
+                    }
+                    should_process = true;
+                }
+            }
+
+            if !should_process || clean_text.is_empty() {
+                continue;
+            }
+
+            info!("🎯 Обрабатываю: '{}'", clean_text);
+
+            {
+                let mut s = state.lock().await;
+                s.last_command = Some(clean_text.clone());
+            }
+
+            *is_speaking_clone.lock().await = true;
+
+            let history = {
+                let h = dialog_history_clone.lock().await;
+                h.clone()
+            };
+
+            match router.execute(&clean_text).await {
+                Ok(cmd_result) => {
+                    info!("✅ Выполнено: {}", cmd_result);
+
+                    {
+                        let mut h = dialog_history_clone.lock().await;
+                        h.push((clean_text.clone(), cmd_result.clone()));
+                        if h.len() > 10 {
+                            h.remove(0);
+                        }
+                    }
+
+                    let tts_clone = tts.clone();
+                    let text_clone = cmd_result;
+                    let speaking_flag = Arc::clone(&is_speaking_clone);
+                    tokio::spawn(async move {
+                        tts_clone.speak(&text_clone).await.ok();
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        *speaking_flag.lock().await = false;
+                    });
                 }
                 Err(_) => {
-                    info!("🤖 Отправляю в Llama 3.3 70B: '{}'", text);
+                    info!("🤖 Отправляю в Llama 3.3 70B: '{}'", clean_text);
                     let brain = CloudBrain::new();
-                    match brain.ask(&text).await {
+
+                    match brain.ask_with_history(&clean_text, &history).await {
                         Ok(response) => {
                             info!("🤖 Ответ: {}", response);
-                            tts.speak(&response).await.ok(); // ← ГОВОРИМ ответ LLM
+
+                            {
+                                let mut h = dialog_history_clone.lock().await;
+                                h.push((clean_text.clone(), response.clone()));
+                                if h.len() > 10 {
+                                    h.remove(0);
+                                }
+                            }
+
+                            let tts_clone = tts.clone();
+                            let text_clone = response;
+                            let speaking_flag = Arc::clone(&is_speaking_clone);
+                            tokio::spawn(async move {
+                                tts_clone.speak(&text_clone).await.ok();
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                *speaking_flag.lock().await = false;
+                            });
                         }
-                        Err(e) => warn!("❌ Ошибка ИИ: {}", e),
+                        Err(e) => {
+                            warn!("❌ Ошибка ИИ: {}", e);
+                            *is_speaking_clone.lock().await = false;
+                        }
                     }
                 }
             }

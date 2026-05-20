@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::SampleFormat;
-use ringbuf::{traits::*, HeapRb};
+use anyhow::Result;
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 use super::stt::SttEngine;
@@ -17,196 +17,124 @@ impl AudioCapture {
     }
 
     pub async fn run(self, tx: tokio::sync::mpsc::Sender<String>) -> Result<()> {
-        let host = cpal::default_host();
-        let device = host
-            .input_devices()?
-            .find(|d| {
-                d.name()
-                    .map(|n| n.contains("USB") || n.contains("usb") || n.contains("Microphone"))
-                    .unwrap_or(false)
-            })
-            .unwrap_or_else(|| host.default_input_device().unwrap());
-
-        let device_name = device.name().unwrap_or_default();
-        info!("🎤 Используется микрофон: {}", device_name);
-
-        // Форсируем 48000 Hz — реальная частота USB микрофона
-        let sample_rate = 48000u32;
-        let sample_format = SampleFormat::F32;
-
-        let config = cpal::StreamConfig {
-            channels: 1,
-            sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
-
-        info!(
-            "📊 Формат: {:?}, Sample rate: {} Hz (форсировано)",
-            sample_format, sample_rate
-        );
-
-        let ring = HeapRb::<f32>::new(sample_rate as usize * 60);
-        let (mut producer, mut consumer) = ring.split();
-
-        let err_fn = |err| eprintln!("Ошибка аудиопотока: {}", err);
-
-        let stream = match sample_format {
-            SampleFormat::F32 => device.build_input_stream(
-                &config,
-                move |data: &[f32], _| {
-                    for &sample in data {
-                        if producer.try_push(sample).is_err() {
-                            eprintln!("⚠️ Аудиобуфер переполнен!");
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )?,
-            SampleFormat::I16 => device.build_input_stream(
-                &config,
-                move |data: &[i16], _| {
-                    for &sample in data {
-                        let sample = sample as f32 / i16::MAX as f32;
-                        if producer.try_push(sample).is_err() {
-                            eprintln!("⚠️ Аудиобуфер переполнен!");
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )?,
-            SampleFormat::U16 => device.build_input_stream(
-                &config,
-                move |data: &[u16], _| {
-                    for &sample in data {
-                        let sample = (sample as f32 / u16::MAX as f32) * 2.0 - 1.0;
-                        if producer.try_push(sample).is_err() {
-                            eprintln!("⚠️ Аудиобуфер переполнен!");
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )?,
-            _ => return Err(anyhow!("Формат {:?} не поддерживается", sample_format)),
-        };
-
-        stream.play()?;
-        info!("▶️  Аудиопоток запущен. Говорите...");
-
-        let mut audio_buffer: Vec<f32> = Vec::new();
-        let mut silence_frames: u32 = 0;
-        let silence_threshold = 0.05;
-        let silence_frames_required = 15;
-        let min_audio_duration = sample_rate as usize;
+        info!("▶️ Аудиозахват: VAD + фильтр шума");
 
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
 
-            let mut chunk = Vec::new();
-            while let Some(sample) = consumer.try_pop() {
-                chunk.push(sample);
-            }
+            let raw_path = format!("/tmp/kuro_raw_{}.wav", timestamp);
 
-            if chunk.is_empty() {
+            // parec -> sox: highpass/lowpass режут шум + silence VAD
+            let record = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "parec --rate=48000 --channels=1 --format=s16le 2>/dev/null | \
+                     sox -t raw -r 48000 -c 1 -b 16 -e signed - {} \
+                     highpass 200 lowpass 4000 \
+                     silence 1 0.1 1% 1 0.5 1%",
+                    raw_path
+                ))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            let success = record.map(|s| s.success()).unwrap_or(false);
+
+            // Fallback: arecord
+            let success = if !success {
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(format!(
+                        "arecord -D plughw:0,0 -r 48000 -c 1 -f S16_LE -t raw 2>/dev/null | \
+                         sox -t raw -r 48000 -c 1 -b 16 -e signed - {} \
+                         highpass 200 lowpass 4000 \
+                         silence 1 0.1 1% 1 0.5 1%",
+                        raw_path
+                    ))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+
+            if !success {
+                sleep(Duration::from_millis(300)).await;
                 continue;
             }
 
-            let rms: f32 = chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32;
-            let is_speech = rms > silence_threshold;
+            let metadata = tokio::fs::metadata(&raw_path).await;
+            if metadata.is_err() || metadata.unwrap().len() < 2000 {
+                let _ = tokio::fs::remove_file(&raw_path).await;
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
 
-            if is_speech {
-                audio_buffer.extend_from_slice(&chunk);
-                silence_frames = 0;
-            } else {
-                if !audio_buffer.is_empty() {
-                    audio_buffer.extend_from_slice(&chunk);
-                    silence_frames += 1;
+            // Проверяем: шум или нормальная речь?
+            let stat_output = Command::new("sox")
+                .args([&raw_path, "-n", "stat"])
+                .stderr(Stdio::piped())
+                .output();
 
-                    if silence_frames >= silence_frames_required
-                        && audio_buffer.len() >= min_audio_duration
-                    {
-                        info!(
-                            "🎤 Фраза завершена, буфер: {} сэмплов ({:.1} сек)",
-                            audio_buffer.len(),
-                            audio_buffer.len() as f32 / sample_rate as f32
-                        );
-
-                        let temp_path = format!(
-                            "/tmp/kuro_audio_{}.wav",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis()
-                        );
-
-                        info!("💾 Сохраняю WAV (48000 Hz): {}", temp_path);
-                        self.write_wav(&temp_path, &audio_buffer).await?;
-                        info!("✅ WAV сохранён");
-
-                        match self.stt.recognize_file(&temp_path).await {
-                            Ok(text) => {
-                                if !text.is_empty() {
-                                    info!("📍 Распознано: '{}'", text);
-                                    let _ = tx.send(text).await;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("❌ Ошибка распознавания: {}", e);
+            let mut max_amp = 0.0f32;
+            let mut length_sec = 0.0f32;
+            if let Ok(output) = stat_output {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                for line in stderr.lines() {
+                    if line.contains("Maximum amplitude") {
+                        if let Some(val) = line.split_whitespace().last() {
+                            if let Ok(v) = val.parse::<f32>() {
+                                max_amp = v;
                             }
                         }
-
-                        audio_buffer.clear();
-                        silence_frames = 0;
+                    }
+                    if line.contains("Length (seconds)") {
+                        if let Some(val) = line.split_whitespace().last() {
+                            if let Ok(v) = val.parse::<f32>() {
+                                length_sec = v;
+                            }
+                        }
                     }
                 }
             }
 
-            if audio_buffer.len() > sample_rate as usize * 30 {
-                warn!("⚠️ Буфер переполнен (30 сек), форсирую сохранение");
+            info!(
+                "📊 Амплитуда: {:.3}, Длительность: {:.2} сек",
+                max_amp, length_sec
+            );
 
-                let temp_path = format!(
-                    "/tmp/kuro_audio_forced_{}.wav",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis()
-                );
+            if max_amp < 0.10 {
+                info!("🔇 Слишком тихо (шум?), игнорирую");
+                let _ = tokio::fs::remove_file(&raw_path).await;
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
 
-                self.write_wav(&temp_path, &audio_buffer).await?;
+            if length_sec < 0.4 {
+                info!("🔇 Слишком коротко (щелчок?), игнорирую");
+                let _ = tokio::fs::remove_file(&raw_path).await;
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
 
-                match self.stt.recognize_file(&temp_path).await {
-                    Ok(text) if !text.is_empty() => {
+            match self.stt.recognize_file(&raw_path).await {
+                Ok(text) => {
+                    if !text.is_empty() {
                         let _ = tx.send(text).await;
                     }
-                    _ => {}
                 }
-
-                audio_buffer.clear();
-                silence_frames = 0;
-                let _ = tokio::fs::remove_file(&temp_path).await;
+                Err(e) => {
+                    warn!("❌ Ошибка распознавания: {}", e);
+                }
             }
+
+            let _ = tokio::fs::remove_file(&raw_path).await;
+            sleep(Duration::from_millis(200)).await;
         }
-    }
-
-    async fn write_wav(&self, path: &str, samples: &[f32]) -> Result<()> {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 48000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-
-        let mut writer = hound::WavWriter::create(path, spec)?;
-
-        for &sample in samples {
-            let clamped = sample.clamp(-1.0, 1.0);
-            let int_sample = (clamped * i16::MAX as f32) as i16;
-            writer.write_sample(int_sample)?;
-        }
-
-        writer.finalize()?;
-        Ok(())
     }
 }

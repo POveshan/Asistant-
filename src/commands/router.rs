@@ -14,7 +14,7 @@ impl CommandRouter {
     pub fn new(kde: KdeIntegration) -> Self {
         let mut patterns = HashMap::new();
 
-        // Паттерны команд
+        // Паттерны команд (точные фразы)
         patterns.insert(
             "terminal".to_string(),
             Regex::new(r"(терминал|консоль|konsole|terminal)").unwrap(),
@@ -22,6 +22,14 @@ impl CommandRouter {
         patterns.insert(
             "browser".to_string(),
             Regex::new(r"(браузер|firefox|chrome|веб)").unwrap(),
+        );
+        patterns.insert(
+            "open_terminal".to_string(),
+            Regex::new(r"открой\s+(терминал|консоль|konsole)").unwrap(),
+        );
+        patterns.insert(
+            "open_browser".to_string(),
+            Regex::new(r"открой\s+(браузер|firefox|chrome|веб)").unwrap(),
         );
         patterns.insert(
             "volume".to_string(),
@@ -62,14 +70,25 @@ impl CommandRouter {
     pub async fn execute(&self, text: &str) -> Result<String> {
         let text_lower = text.to_lowercase();
 
-        // Проверяем паттерны
+        // Сначала проверяем точные фразы "открой ..."
+        if self.patterns["open_terminal"].is_match(&text_lower) {
+            self.kde.launch_app("konsole").await?;
+            return Ok("Терминал открыт".to_string());
+        }
+
+        if self.patterns["open_browser"].is_match(&text_lower) {
+            let browser = std::env::var("BROWSER").unwrap_or_else(|_| "firefox".to_string());
+            self.kde.launch_app(&browser).await?;
+            return Ok(format!("Браузер {} открыт", browser));
+        }
+
+        // Потом общие паттерны
         if self.patterns["terminal"].is_match(&text_lower) {
             self.kde.launch_app("konsole").await?;
             return Ok("Терминал открыт".to_string());
         }
 
         if self.patterns["browser"].is_match(&text_lower) {
-            // Определяем предпочитаемый браузер
             let browser = std::env::var("BROWSER").unwrap_or_else(|_| "firefox".to_string());
             self.kde.launch_app(&browser).await?;
             return Ok(format!("Браузер {} открыт", browser));
@@ -104,7 +123,6 @@ impl CommandRouter {
         }
 
         if self.patterns["shutdown"].is_match(&text_lower) {
-            // Двойная проверка для опасных команд
             warn!("Запрошено выключение");
             self.kde.shutdown().await?;
             return Ok("Система выключается".to_string());
@@ -122,13 +140,11 @@ impl CommandRouter {
         }
 
         if self.patterns["weather"].is_match(&text_lower) {
-            // TODO: интеграция с погодой (wttr.in или API)
             return Err(anyhow!(
                 "Погода пока не реализована — отправлю в Groq позже"
             ));
         }
 
-        // Если не распознали — отправим в Groq (позже)
         Err(anyhow!("Команда не распознана: '{}'", text))
     }
 }

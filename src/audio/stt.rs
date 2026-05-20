@@ -1,18 +1,15 @@
 use anyhow::{anyhow, Result};
-use reqwest::Client;
-
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tracing::{info, warn};
 
 pub struct SttEngine {
-    client: Client,
     api_key: String,
 }
 
 impl Clone for SttEngine {
     fn clone(&self) -> Self {
         Self {
-            client: self.client.clone(),
             api_key: self.api_key.clone(),
         }
     }
@@ -26,10 +23,8 @@ impl SttEngine {
             warn!("GROQ_API_KEY не установлен!");
         }
 
-        let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-
-        info!("🧠 STT: Groq Whisper API");
-        Ok(Self { client, api_key })
+        info!("🧠 STT: Groq Whisper API (через curl)");
+        Ok(Self { api_key })
     }
 
     pub async fn process_chunk(&self, _chunk: &[f32]) -> Result<Option<String>> {
@@ -37,37 +32,50 @@ impl SttEngine {
     }
 
     pub async fn recognize_file(&self, wav_path: &str) -> Result<String> {
-        info!("🔍 Отправляю аудио в Groq Whisper...");
+        info!("🔍 Отправляю аудио в Groq Whisper через curl...");
 
-        let file_bytes = tokio::fs::read(wav_path).await?;
+        // Используем curl с socks5 прокси NekoBox
+        let output = Command::new("curl")
+            .args(&[
+                "-s",
+                "-x",
+                "socks5h://127.0.0.1:2080",
+                "--connect-timeout",
+                "30",
+                "--max-time",
+                "60",
+                "-X",
+                "POST",
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                "-H",
+                &format!("Authorization: Bearer {}", self.api_key),
+                "-F",
+                "model=whisper-large-v3",
+                "-F",
+                "language=ru",
+                "-F",
+                "response_format=text",
+                "-F",
+                &format!("file=@{}", wav_path),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| anyhow!("curl не запустился: {}", e))?;
 
-        let form = reqwest::multipart::Form::new()
-            .part(
-                "file",
-                reqwest::multipart::Part::bytes(file_bytes)
-                    .file_name("audio.wav")
-                    .mime_str("audio/wav")?,
-            )
-            .text("model", "whisper-large-v3")
-            .text("language", "ru")
-            .text("response_format", "text");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-        let response = self
-            .client
-            .post("https://api.groq.com/openai/v1/audio/transcriptions")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| anyhow!("Groq Whisper недоступен: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let err = response.text().await?;
-            return Err(anyhow!("Groq Whisper ошибка {}: {}", status, err));
+        if !output.status.success() {
+            return Err(anyhow!("Groq ошибка: {} | stderr: {}", stdout, stderr));
         }
 
-        let text = response.text().await?.trim().to_string();
+        // Проверяем, что ответ не JSON с ошибкой
+        if stdout.trim().starts_with('{') {
+            return Err(anyhow!("Groq API ошибка: {}", stdout));
+        }
+
+        let text = stdout.trim().to_string();
         info!("📝 Распознано: '{}'", text);
         Ok(text)
     }
