@@ -151,10 +151,4 @@ impl KdeIntegration {
         Ok(())
     }
 
-    /// Получение списка окон (для GameDetector позже)
-    pub async fn get_windows(&self) -> Result<Vec<String>> {
-        let proxy = KWinProxy::new(&self.dbus).await?;
-        let active = proxy.active_window().await?;
-        Ok(vec![active])
-    }
 }

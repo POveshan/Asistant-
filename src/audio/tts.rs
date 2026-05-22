@@ -1,92 +1,96 @@
-use anyhow::{anyhow, Result};
-use std::process::Command;
-use tracing::{info, warn};
+use anyhow::Result;
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct TtsEngine {
-    venv_python: String,
+    inner: Arc<TtsEngineInner>,
 }
 
-impl TtsEngine {
-    pub fn new() -> Self {
-        let venv_python = format!(
-            "{}/.local/share/kuro-tts/bin/python3",
-            std::env::var("HOME").unwrap_or_default()
-        );
+struct TtsEngineInner {
+    process: Mutex<std::process::Child>,
+    stdin: Mutex<std::process::ChildStdin>,
+    stdout: Mutex<BufReader<std::process::ChildStdout>>,
+}
 
-        info!("🔊 TTS: Silero (через Python venv)");
-        Self { venv_python }
+const PID_FILE: &str = "/tmp/kuro_tts.pid";
+
+impl TtsEngine {
+    pub fn new() -> Result<Self> {
+        if Path::new(PID_FILE).exists() {
+            println!("Подключаемся к существующему TTS серверу...");
+        }
+
+        let mut process = Command::new("/home/kde_user/step_counter/.venv_tts/bin/python")
+            .arg("/home/kde_user/step_counter/tts_server.py")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let pid = process.id();
+        std::fs::write(PID_FILE, pid.to_string())?;
+
+        let stdin = process.stdin.take().unwrap();
+        let stdout = BufReader::new(process.stdout.take().unwrap());
+
+        Ok(Self {
+            inner: Arc::new(TtsEngineInner {
+                process: Mutex::new(process),
+                stdin: Mutex::new(stdin),
+                stdout: Mutex::new(stdout),
+            }),
+        })
     }
 
-    pub async fn speak(&self, text: &str) -> Result<()> {
-        if text.is_empty() {
-            return Ok(());
+    pub fn speak(&self, text: &str) -> Result<String> {
+        let mut stdin = self.inner.stdin.lock().unwrap();
+        writeln!(stdin, "{}", text)?;
+        stdin.flush()?;
+
+        let mut stdout = self.inner.stdout.lock().unwrap();
+        let mut response = String::new();
+        stdout.read_line(&mut response)?;
+        let wav_path = response.trim().to_string();
+
+        if wav_path.is_empty() {
+            anyhow::bail!("TTS ошибка генерации");
         }
 
-        info!("🔊 Говорю: {}", text);
+        Ok(wav_path)
+    }
 
-        let safe_text = text.replace("'", "\\'").replace("\"", "\\\"");
+    pub fn stop_speaking(&self) {
+        let _ = Command::new("pkill").args(&["-9", "ffplay"]).status();
+        let _ = Command::new("pkill").args(&["-9", "aplay"]).status();
+    }
 
-        let script = format!(
-            r#"
-import torch
-import soundfile as sf
-import subprocess
+    pub fn play_audio(&self, wav_path: &str) -> Result<()> {
+        let status = Command::new("ffplay")
+            .args(&["-nodisp", "-autoexit", wav_path])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
 
-device = torch.device('cpu')
-model, _ = torch.hub.load('snakers4/silero-models', 'silero_tts', language='ru', speaker='v5_ru', trust_repo=True)
-audio = model.apply_tts(text='{}', speaker='kseniya', sample_rate=48000)
-sf.write('/tmp/kuro_tts_raw.wav', audio.numpy(), 48000)
-
-result = subprocess.run(['sox', '/tmp/kuro_tts_raw.wav', '/tmp/kuro_tts_output.wav', 'pitch', '300'], capture_output=True)
-if result.returncode != 0:
-    import shutil
-    shutil.copy('/tmp/kuro_tts_raw.wav', '/tmp/kuro_tts_output.wav')
-"#,
-            safe_text
-        );
-
-        let output = Command::new(&self.venv_python)
-            .arg("-c")
-            .arg(&script)
-            .output()
-            .map_err(|e| anyhow!("Python TTS не запустился: {}", e))?;
-
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            warn!("TTS ошибка: {}", err);
-            let _ = Command::new("ffplay")
-                .args(&["-nodisp", "-autoexit", "/tmp/kuro_tts_raw.wav"])
-                .status();
-            return Ok(());
-        }
-
-        let play_status = Command::new("ffplay")
-            .args(&[
-                "-nodisp",
-                "-autoexit",
-                "-volume",
-                "100",
-                "/tmp/kuro_tts_output.wav",
-            ])
-            .status();
-
-        if play_status.is_err() || !play_status.unwrap().success() {
-            let _ = Command::new("aplay")
-                .arg("/tmp/kuro_tts_output.wav")
-                .status();
+        if !status.success() {
+            Command::new("aplay")
+                .arg(wav_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
         }
 
         Ok(())
     }
+}
 
-    pub fn stop_speaking() {
-        info!("🛑 Остановка озвучки");
-        let _ = std::process::Command::new("pkill")
-            .args(&["-9", "ffplay"])
-            .status();
-        let _ = std::process::Command::new("pkill")
-            .args(&["-9", "aplay"])
-            .status();
+impl Drop for TtsEngineInner {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdin.get_mut().unwrap(), "__EXIT__");
+        let _ = self.stdin.get_mut().unwrap().flush();
+        let _ = self.process.get_mut().unwrap().wait();
+        let _ = std::fs::remove_file(PID_FILE);
     }
 }

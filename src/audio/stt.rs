@@ -1,81 +1,71 @@
 use anyhow::{anyhow, Result};
-use std::process::{Command, Stdio};
-use std::time::Duration;
-use tracing::{info, warn};
+use std::process::Command;
+use tracing::{error, info};
 
 pub struct SttEngine {
     api_key: String,
-}
-
-impl Clone for SttEngine {
-    fn clone(&self) -> Self {
-        Self {
-            api_key: self.api_key.clone(),
-        }
-    }
+    proxy: String,
 }
 
 impl SttEngine {
     pub fn new() -> Result<Self> {
-        let api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
-
-        if api_key.is_empty() {
-            warn!("GROQ_API_KEY не установлен!");
-        }
-
-        info!("🧠 STT: Groq Whisper API (через curl)");
-        Ok(Self { api_key })
+        let api_key = std::env::var("GROQ_API_KEY")
+            .unwrap_or_else(|_| {
+                info!("⚠️ GROQ_API_KEY не найден, STT работать не будет");
+                String::new()
+            });
+        
+        let proxy = "socks5h://127.0.0.1:2080".to_string();
+        
+        Ok(Self { api_key, proxy })
     }
-
-    pub async fn process_chunk(&self, _chunk: &[f32]) -> Result<Option<String>> {
-        Ok(None)
-    }
-
+    
+    /// Основной метод распознавания (для совместимости с capture.rs)
     pub async fn recognize_file(&self, wav_path: &str) -> Result<String> {
+        self.transcribe(wav_path).await
+    }
+    
+    /// Распознавание речи через Groq Whisper API
+    pub async fn transcribe(&self, wav_path: &str) -> Result<String> {
+        if self.api_key.is_empty() {
+            return Err(anyhow!("GROQ_API_KEY не установлен"));
+        }
+        
         info!("🔍 Отправляю аудио в Groq Whisper через curl...");
-
-        // Используем curl с socks5 прокси NekoBox
+        
         let output = Command::new("curl")
             .args(&[
-                "-s",
-                "-x",
-                "socks5h://127.0.0.1:2080",
-                "--connect-timeout",
-                "30",
-                "--max-time",
-                "60",
-                "-X",
-                "POST",
+                "--proxy", &self.proxy,
+                "--connect-timeout", "30",
+                "--max-time", "60",
+                "-s", "-X", "POST",
                 "https://api.groq.com/openai/v1/audio/transcriptions",
-                "-H",
-                &format!("Authorization: Bearer {}", self.api_key),
-                "-F",
-                "model=whisper-large-v3",
-                "-F",
-                "language=ru",
-                "-F",
-                "response_format=text",
-                "-F",
-                &format!("file=@{}", wav_path),
+                "-H", &format!("Authorization: Bearer {}", self.api_key),
+                "-H", "Content-Type: multipart/form-data",
+                "-F", "model=whisper-large-v3",
+                "-F", &format!("file=@{}", wav_path),
             ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| anyhow!("curl не запустился: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
+            .output()?;
+        
         if !output.status.success() {
-            return Err(anyhow!("Groq ошибка: {} | stderr: {}", stdout, stderr));
+            let err = String::from_utf8_lossy(&output.stderr);
+            error!("❌ Curl ошибка: {}", err);
+            return Err(anyhow!("Curl failed: {}", err));
         }
-
-        // Проверяем, что ответ не JSON с ошибкой
-        if stdout.trim().starts_with('{') {
-            return Err(anyhow!("Groq API ошибка: {}", stdout));
+        
+        let response = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&response)?;
+        
+        let text = json["text"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        
+        if text.is_empty() {
+            return Err(anyhow!("Пустой ответ от API"));
         }
-
-        let text = stdout.trim().to_string();
+        
         info!("📝 Распознано: '{}'", text);
         Ok(text)
     }

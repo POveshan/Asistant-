@@ -32,23 +32,24 @@ async fn main() -> Result<()> {
     let router = CommandRouter::new(kde);
     let stt = SttEngine::new()?;
     let capture = AudioCapture::new(stt)?;
-    let tts = TtsEngine::new();
+    let tts = TtsEngine::new()?;
 
     let is_speaking = Arc::new(Mutex::new(false));
     let is_awake = Arc::new(Mutex::new(false));
-    let dialog_history = Arc::new(Mutex::new(Vec::new()));
+    let dialog_history = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
 
-    let audio_task = async move {
+    let audio_handle = tokio::spawn(async move {
         if let Err(e) = capture.run(tx).await {
             error!("Ошибка захвата аудио: {}", e);
         }
-    };
+    });
 
     let is_speaking_clone = Arc::clone(&is_speaking);
     let is_awake_clone = Arc::clone(&is_awake);
     let dialog_history_clone = Arc::clone(&dialog_history);
+    let tts_clone_main = tts.clone();
 
     let router_handle = tokio::spawn(async move {
         while let Some(text) = rx.recv().await {
@@ -59,13 +60,13 @@ async fn main() -> Result<()> {
                 let stop_words = ["хватит", "прекрати", "заткнись", "стоп", "тихо", "замолчи"];
                 if stop_words.iter().any(|&w| lower.contains(w)) {
                     info!("🛑 Стоп-слово! Прерываю...");
-                    TtsEngine::stop_speaking();
+                    tts_clone_main.stop_speaking();
                     *is_speaking_clone.lock().await = false;
                     continue;
                 }
 
                 info!("🛑 Новый запрос! Прерываю текущую речь...");
-                TtsEngine::stop_speaking();
+                tts_clone_main.stop_speaking();
                 *is_speaking_clone.lock().await = false;
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
             }
@@ -73,8 +74,8 @@ async fn main() -> Result<()> {
             let text = lower.trim().to_string();
             info!("📝 Распознано: '{}'", text);
 
-            let mut clean_text = String::new();
-            let mut should_process = false;
+            let clean_text;
+            let should_process;
 
             // Wake word логика
             {
@@ -90,16 +91,20 @@ async fn main() -> Result<()> {
                             .to_string();
 
                         if clean_text.is_empty() {
-                            // Только "Шилов" — отвечаем
                             info!("🌅 Шилов проснулся!");
                             let tts_clone = tts.clone();
                             tokio::spawn(async move {
-                                tts_clone.speak("Да, я здесь").await.ok();
+                                match tts_clone.speak("Да, я здесь") {
+                                    Ok(wav_path) => {
+                                        let _ = tts_clone.play_audio(&wav_path);
+                                    }
+                                    Err(e) => error!("TTS ошибка: {}", e),
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                             });
                             continue;
                         }
 
-                        // "Шилов открой браузер" — просыпаемся И сразу выполняем
                         info!("🌅 Шилов проснулся и сразу выполняет: '{}'", clean_text);
                         should_process = true;
                     } else {
@@ -107,7 +112,6 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 } else {
-                    // Уже бодрствует — убираем wake word если есть
                     clean_text = text
                         .replace("шилов", "")
                         .replace("шил", "")
@@ -155,7 +159,12 @@ async fn main() -> Result<()> {
                     let text_clone = cmd_result;
                     let speaking_flag = Arc::clone(&is_speaking_clone);
                     tokio::spawn(async move {
-                        tts_clone.speak(&text_clone).await.ok();
+                        match tts_clone.speak(&text_clone) {
+                            Ok(wav_path) => {
+                                let _ = tts_clone.play_audio(&wav_path);
+                            }
+                            Err(e) => error!("TTS ошибка: {}", e),
+                        }
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         *speaking_flag.lock().await = false;
                     });
@@ -180,7 +189,12 @@ async fn main() -> Result<()> {
                             let text_clone = response;
                             let speaking_flag = Arc::clone(&is_speaking_clone);
                             tokio::spawn(async move {
-                                tts_clone.speak(&text_clone).await.ok();
+                                match tts_clone.speak(&text_clone) {
+                                    Ok(wav_path) => {
+                                        let _ = tts_clone.play_audio(&wav_path);
+                                    }
+                                    Err(e) => error!("TTS ошибка: {}", e),
+                                }
                                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                                 *speaking_flag.lock().await = false;
                             });
@@ -195,8 +209,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    audio_task.await;
-    router_handle.await?;
+    tokio::select! {
+        _ = audio_handle => {},
+        _ = router_handle => {},
+    }
 
     Ok(())
 }

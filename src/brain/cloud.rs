@@ -1,26 +1,29 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde_json::json;
-use std::time::Duration;
-use tracing::info;
+use tracing::{error, info};
 
 pub struct CloudBrain {
     client: Client,
     api_key: String,
+    model: String,
 }
 
 impl CloudBrain {
     pub fn new() -> Self {
-        let api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap();
-        Self { client, api_key }
-    }
+        let api_key = std::env::var("GROQ_API_KEY").unwrap_or_else(|_| {
+            info!("⚠️ GROQ_API_KEY не найден, ИИ работать не будет");
+            String::new()
+        });
 
-    pub async fn ask(&self, prompt: &str) -> Result<String> {
-        self.ask_with_history(prompt, &[]).await
+        Self {
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
+            api_key,
+            model: "llama-3.3-70b-versatile".to_string(),
+        }
     }
 
     pub async fn ask_with_history(
@@ -29,51 +32,52 @@ impl CloudBrain {
         history: &[(String, String)],
     ) -> Result<String> {
         if self.api_key.is_empty() {
-            return Err(anyhow!("GROQ_API_KEY не установлен!"));
+            return Err(anyhow!("GROQ_API_KEY не установлен"));
         }
-        info!("🧠 Groq LLM: llama-3.3-70b-versatile (с историей)");
 
-        // Собираем messages: system + история + текущий prompt
-        let mut messages = vec![
-            json!({"role": "system", "content": "Ты голосовой ассистент Шилов. Отвечай кратко по-русски. Помни контекст разговора."}),
-        ];
+        info!("🧠 Groq LLM: {} (с историей)", self.model);
 
-        // Добавляем историю (последние 5 пар)
-        for (user_msg, assistant_msg) in history.iter().rev().take(5).rev() {
+        let mut messages = vec![json!({
+            "role": "system",
+            "content": "Ты — голосовой ассистент Шилов. Отвечай кратко, по-русски, дружелюбно. Максимум 2-3 предложения."
+        })];
+
+        for (user_msg, assistant_msg) in history.iter().take(5) {
             messages.push(json!({"role": "user", "content": user_msg}));
             messages.push(json!({"role": "assistant", "content": assistant_msg}));
         }
 
-        // Текущий вопрос
         messages.push(json!({"role": "user", "content": prompt}));
 
         let response = self
             .client
             .post("https://api.groq.com/openai/v1/chat/completions")
             .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
             .json(&json!({
-                "model": "llama-3.3-70b-versatile",
+                "model": self.model,
                 "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 150
+                "max_tokens": 256,
+                "temperature": 0.7
             }))
             .send()
-            .await
-            .map_err(|e| anyhow!("Groq недоступен: {}", e))?;
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await?;
-            return Err(anyhow!("Groq ошибка {}: {}", status, text));
+            let text = response.text().await.unwrap_or_default();
+            error!("❌ Groq API ошибка {}: {}", status, text);
+            return Err(anyhow!("API error {}: {}", status, text));
         }
 
         let json: serde_json::Value = response.json().await?;
-        let text = json["choices"][0]["message"]["content"]
+        let content = json["choices"][0]["message"]["content"]
             .as_str()
-            .unwrap_or("...")
+            .unwrap_or("Не понял вопрос")
             .trim()
             .to_string();
-        info!("🤖 Ответ: {}", text);
-        Ok(text)
+
+        info!("🤖 Ответ: {}", content);
+        Ok(content)
     }
 }
